@@ -402,7 +402,7 @@
     if (a.stability != null) out.push({ lvl: a.stability <= 15 ? 'good' : 'warn', txt: a.stability <= 15 ? `Lange Töne sind stabil (±${a.stability} ct).` : `Lange Töne schwanken um ±${a.stability} ct. Gleichmäßiger Atemfluss ist hier der Hebel.` });
     if (a.vibrato) out.push({ lvl: 'info', txt: `Vibrato erkannt: ${a.vibrato.rate} Hz, ±${a.vibrato.extent} ct auf ${a.vibrato.notes} Ton/Tönen.` });
     if (a.perNote && a.perNote.length) {
-      const worst = a.perNote.filter(p => p.cents != null).sort((x, y) => Math.abs(y.cents) - Math.abs(x.cents)).slice(0, 2).filter(p => Math.abs(p.cents) > 50);
+      const worst = a.perNote.filter(p => p.cents != null && Math.abs(p.cents) > 50).sort((x, y) => Math.abs(y.cents) - Math.abs(x.cents)).slice(0, 2);
       if (worst.length) out.push({ lvl: 'warn', txt: 'Größte Abweichungen: ' + worst.map(p => `„${p.lyr || midiToName(p.m)}“ (${midiToName(p.m)}, ${p.cents > 0 ? '+' : ''}${p.cents} ct)`).join(', ') + '.' });
     }
     return out;

@@ -48,6 +48,8 @@
     let y0 = opts.yMin != null ? opts.yMin : Math.min(...ys), y1 = opts.yMax != null ? opts.yMax : Math.max(...ys);
     if (y1 - y0 < 1) { y0 -= 1; y1 += 1; }
     const xs = points.map(p => p.x); let x0 = Math.min(...xs), x1 = Math.max(...xs); if (x1 === x0) { x0 -= 86400000; x1 += 86400000; }
+    // Achse bis zum nächsten runden Tick verlängern, damit kein Punkt über der obersten Linie schwebt
+    if (opts.yMax == null) { const tk = niceTicks(y0, y1, 4); const stp = tk.length > 1 ? tk[1] - tk[0] : 1; if (tk.length && tk[tk.length - 1] < y1) y1 = tk[tk.length - 1] + stp; }
     const X = x => pl + (x - x0) / (x1 - x0) * (f.w - pl - pr);
     const Y = y => pt + (1 - (y - y0) / (y1 - y0)) * (f.h - pt - pb);
     const g = el('g', { class: 'grid' }, f.svg), ax = el('g', { class: 'axis' }, f.svg);
@@ -103,7 +105,7 @@
     const steps = ['#cde2fb', '#86b6ef', '#3987e5', '#1c5cab'];
     for (let i = 0; i < weeks * 7; i++) {
       const d = new Date(start); d.setDate(start.getDate() + i);
-      const key = d.toISOString().slice(0, 10);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; // lokales Datum (toISOString wäre UTC → Tag verschoben)
       const c = document.createElement('i');
       const v = dayMinutes[key] || 0;
       if (d > today) c.style.visibility = 'hidden';

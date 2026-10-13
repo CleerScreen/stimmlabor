@@ -2,13 +2,13 @@
 (function () {
   'use strict';
   const C = Core;
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
   const $ = (s, r) => (r || document).querySelector(s);
   const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
   const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
   const dayKey = ts => { const d = new Date(ts); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 10); };
   const fmtDT = ts => new Date(ts).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+  const hitClass = h => h >= 0.6 ? 'good' : h >= 0.3 ? 'warn' : 'bad';
   const lvlClass = s => s == null ? '' : s >= 80 ? 'good' : s >= 55 ? 'warn' : 'bad';
   const ICON = {
     play: '<svg class="ico" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z" fill="currentColor"/></svg>',
@@ -73,6 +73,7 @@
     async mic() {
       await this.ensure();
       if (this.live()) return this.stream;
+      if (this.src) { try { this.src.disconnect(); this.an.disconnect(); this.sink.disconnect(); } catch (e) { } }
       try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) { }
       this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
       this.src = this.ctx.createMediaStreamSource(this.stream);
@@ -96,6 +97,14 @@
       return { m, rms: r.rms, clarity: r.clarity };
     },
     latency() { const c = this.ctx; return (c.outputLatency || 0) + (c.baseLatency || 0) + (this.an ? this.an.fftSize / 2 / c.sampleRate : 0) + S.latencyMs / 1000; },
+    _buf: new Map(),
+    async decode(key, blob) {
+      if (!blob) return null;
+      if (this._buf.has(key)) return this._buf.get(key);
+      const b = await this.ctx.decodeAudioData(await blob.arrayBuffer());
+      if (this._buf.size > 4) this._buf.delete(this._buf.keys().next().value);
+      this._buf.set(key, b); return b;
+    },
     bus(vol) { const g = this.ctx.createGain(); g.gain.value = vol == null ? 1 : vol; g.connect(this.ctx.destination); return g; },
     tone(bus, m, t, d, vol) {
       const c = this.ctx, f = C.midiToHz(m, S.a4);
@@ -137,6 +146,7 @@
   const devCol = c => { const a = Math.abs(c); return a <= 25 ? COL.good : a <= 50 ? COL.warn : COL.bad; };
   function openOverlay(html) { overlay.innerHTML = html; overlay.hidden = false; overlay.scrollTop = 0; return overlay; }
   let overlayCleanup = null;
+  let ACTIVE = null; // finish-Funktion der laufenden Aufnahme (für Hintergrund-Wechsel)
   function closeOverlay() { if (overlayCleanup) { try { overlayCleanup(); } catch (e) { } overlayCleanup = null; } overlay.hidden = true; overlay.innerHTML = ''; render(); }
   function setupCanvas(cv) {
     const dpr = Math.min(2, window.devicePixelRatio || 1); const r = cv.getBoundingClientRect();
@@ -191,9 +201,13 @@
     }
     // eigene Tonhöhe
     const fr = st.frames; g.lineWidth = 3; g.lineCap = 'round';
-    for (let i = 1; i < fr.length; i++) {
+    // nur den sichtbaren Ausschnitt zeichnen (binäre Suche statt alle Frames)
+    let lo = 0, hi = fr.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (fr[mid].t < tA) lo = mid + 1; else hi = mid; }
+    for (let i = Math.max(1, lo); i < fr.length; i++) {
       const a = fr[i - 1], b = fr[i];
-      if (b.t < tA || a.t > tB || a.m == null || b.m == null || b.t - a.t > 0.12) continue;
+      if (a.t > tB) break;
+      if (a.m == null || b.m == null || b.t - a.t > 0.12) continue;
       let ma = a.m, mb = b.m;
       if (st.tol && b.n) { const k = Math.round((b.n.m - mb) / 12) * 12; ma += k; mb += k; }
       g.strokeStyle = b.c == null ? COL.blue : devCol(b.c);
@@ -216,7 +230,7 @@
     let s = null; try { s = JSON.parse(localStorage.getItem('sl.session') || 'null'); } catch (e) { }
     const today = dayKey(Date.now());
     if (!s || s.day !== today) {
-      s = { id: 'se_' + Date.now(), day: today, step: 0, done: {}, takes: [], ex: pickExercise(), song: pickSong() };
+      s = { id: 'se_' + Date.now(), day: today, done: {}, takes: [], ex: pickExercise(), song: pickSong() };
       saveSession(s);
     }
     return s;
@@ -227,13 +241,12 @@
     const stab = recent.map(t => t.metrics.stability).filter(v => v != null);
     const att = recent.map(t => t.metrics.attackMs).filter(v => v != null);
     const iv = TAKES.filter(t => t.refId === 'intervals' && t.metrics).slice(-3).map(t => t.metrics.score);
-    const reasons = [];
     if (stab.length >= 2 && C.mean(stab) > 20) return { id: 'hold', why: `Deine langen Töne schwankten zuletzt um ±${Math.round(C.mean(stab))} ct.` };
     if (att.length >= 2 && C.median(att) > 260) return { id: 'hold', why: `Du brauchst zuletzt ~${Math.round(C.median(att))} ms, bis ein Ton sitzt.` };
     if (iv.length && C.mean(iv) < 65) return { id: 'intervals', why: `Intervalle lagen zuletzt bei ${Math.round(C.mean(iv))}% Treffsicherheit.` };
     const rot = ['scale', 'hold', 'intervals', 'arpeggio'];
     const d = Math.floor(Date.now() / 86400000);
-    return { id: rot[d % rot.length], why: reasons[0] || 'Rotation: jeden Tag ein anderer Schwerpunkt.' };
+    return { id: rot[d % rot.length], why: 'Rotation: jeden Tag ein anderer Schwerpunkt.' };
   }
   function pickSong() {
     const all = C.SONGS.slice().sort((a, b) => a.level - b.level);
@@ -272,8 +285,8 @@
     const stepScore = key => { const ids = (s.done[key] || []); const t = ids.map(tk).filter(t => t && t.metrics && t.metrics.score != null).pop(); return t ? t.metrics.score : null; };
     const steps = [
       { key: 'warmup', title: 'Warm-up', meta: 'Lippenflattern 1 min · Sirene 30 s' },
-      { key: 'exercise', title: 'Übung: ' + ex.title, meta: s.ex.why },
-      { key: 'song', title: 'Song: ' + song.title, meta: (song.artist || '') + ' · <a href="#" data-act="changesong">ändern</a>' },
+      { key: 'exercise', title: 'Übung: ' + ex.title, meta: esc(s.ex.why) },
+      { key: 'song', title: 'Song: ' + song.title, meta: esc(song.artist || '') + ' · <a href="#" data-act="changesong">ändern</a>' },
       { key: 'review', title: 'Auswertung', meta: 'Deine Session im Vergleich zu deinem Schnitt' },
       { key: 'progress', title: 'Fortschritt', meta: 'Verlauf, Stimmumfang, Problem-Töne' }
     ];
@@ -289,7 +302,7 @@
           return `<div class="step ${done ? 'done' : ''} ${i === cur ? 'current' : ''}">
             <div class="num">${done ? '✓' : i + 1}</div>
             <div class="grow"><h3>${esc(x.title)}</h3><div class="meta">${x.meta}</div></div>
-            <div>${sc != null ? `<span class="chip ${lvlClass(sc)}">${sc}%</span>` : `<button class="btn sm ${i === cur ? 'primary' : 'ghost'}" data-step="${x.key}">${done ? 'Nochmal' : 'Start'}</button>`}</div>
+            <div class="row" style="gap:6px">${sc != null ? `<span class="chip ${lvlClass(sc)}">${sc}%</span>` : ''}<button class="btn sm ${i === cur ? 'primary' : 'ghost'}" data-step="${x.key}" aria-label="${esc(x.title)} ${done ? 'wiederholen' : 'starten'}">${done ? (sc != null ? '↻' : 'Nochmal') : 'Start'}</button></div>
           </div>`;
         }).join('')}
       </div>
@@ -300,8 +313,6 @@
     $$('[data-step]').forEach(b => b.addEventListener('click', () => runStep(b.dataset.step)));
     const cs = $('[data-act="changesong"]'); if (cs) cs.addEventListener('click', e => { e.preventDefault(); chooseSong(); });
     const ob = $('[data-act="onboard"]'); if (ob) ob.addEventListener('click', openOnboarding);
-    // Schritt ohne Score aber erledigt: Button "Nochmal" anzeigen
-    $$('.step.done').forEach(el => { if (!el.querySelector('button')) { } });
   }
   function markDone(key, takeId) {
     const s = todaySession(); s.done[key] = s.done[key] || []; if (takeId) s.done[key].push(takeId); else if (!s.done[key].length) s.done[key].push('x');
@@ -371,10 +382,14 @@
     try {
       const j = JSON.parse(await file.text());
       if (j.format !== 'singpack' || !Array.isArray(j.notes)) throw new Error('Keine .singpack-Datei');
+      const num = v => typeof v === 'number' && isFinite(v);
+      const notes = j.notes.filter(n => n && num(n.t) && num(n.d) && num(n.m) && n.d > 0 && n.m > 20 && n.m < 110).sort((a, b) => a.t - b.t);
+      if (notes.length < 3) throw new Error('Datei enthält keine gültigen Töne');
+      if (j.curve && !(num(j.curve.dt) && j.curve.dt > 0 && Array.isArray(j.curve.m))) j.curve = null;
       const b64 = (d, mime) => { const bin = atob(d); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return new Blob([u], { type: mime }); };
       const rec = {
-        id: 'imp_' + Date.now(), imported: true, title: j.title || file.name, artist: j.artist || 'Eigener Song', bpm: j.bpm || null, duration: j.duration,
-        notes: j.notes.map(n => ({ t: n.t, d: n.d, m: n.m, lyr: n.lyr || '' })), curve: j.curve || null,
+        id: 'imp_' + Date.now(), imported: true, title: String(j.title || file.name).slice(0, 80), artist: String(j.artist || 'Eigener Song').slice(0, 80), bpm: j.bpm || null, duration: j.duration,
+        notes: notes.map(n => ({ t: n.t, d: n.d, m: n.m, lyr: typeof n.lyr === 'string' ? n.lyr.slice(0, 40) : '' })), curve: j.curve ? { t0: num(j.curve.t0) ? j.curve.t0 : 0, dt: j.curve.dt, m: j.curve.m.map(v => num(v) ? v : null) } : null,
         audio: j.audio ? b64(j.audio.data, j.audio.mime) : null, guide: j.guide ? b64(j.guide.data, j.guide.mime) : null, added: Date.now()
       };
       await DB.put('songs', rec); await reload(); render(); toast(`„${rec.title}“ importiert (${rec.notes.length} Töne)`);
@@ -547,8 +562,8 @@
       try { await A.mic(); } catch (e) { go.disabled = false; $('#stt', o).textContent = 'Kein Mikrofonzugriff. In iOS: Einstellungen → Safari → Mikrofon erlauben (bzw. beim Start „Erlauben“ tippen).'; return; }
       const ctx = A.ctx;
       let backingBuf = null, guideBuf = null;
-      if (song.imported && song.audioBlob) { $('#stt', o).textContent = 'Song wird geladen …'; try { backingBuf = await ctx.decodeAudioData(await song.audioBlob.arrayBuffer()); } catch (e) { toast('Audio konnte nicht dekodiert werden'); } }
-      if (song.imported && song.guideOn && song.guideBlob) { try { guideBuf = await ctx.decodeAudioData(await song.guideBlob.arrayBuffer()); } catch (e) { } }
+      if (song.imported && song.audioBlob) { $('#stt', o).textContent = 'Song wird geladen …'; try { backingBuf = await A.decode(song.id + ':a', song.audioBlob); } catch (e) { toast('Audio konnte nicht dekodiert werden'); } }
+      if (song.imported && song.guideOn && song.guideBlob) { try { guideBuf = await A.decode(song.id + ':g', song.guideBlob); } catch (e) { } }
       bus = A.bus(1); unlock = wakeLock();
       rec = startRecorder(A.stream); recStart = ctx.currentTime;
       const countBeats = song.kind === 'exercise' ? 4 : (song.bpb || 4);
@@ -564,7 +579,7 @@
       }
       if (backingBuf) { backing = ctx.createBufferSource(); backing.buffer = backingBuf; backing.connect(bus); backing.start(t0); }
       if (guideBuf) { const g = ctx.createGain(); g.gain.value = 0.35; g.connect(bus); guideSrc = ctx.createBufferSource(); guideSrc.buffer = guideBuf; guideSrc.connect(g); guideSrc.start(t0); }
-      running = true; $('#stt', o).textContent = song.kind === 'song' ? 'Sing mit! Die farbige Linie bist du.' : 'Erst zuhören (grau), dann nachsingen (farbig).';
+      running = true; ACTIVE = () => finish(false); $('#stt', o).textContent = song.kind === 'song' ? 'Sing mit! Die farbige Linie bist du.' : 'Erst zuhören (grau), dann nachsingen (farbig).';
       go.disabled = false; go.innerHTML = ICON.stop + ' Beenden'; go.classList.remove('primary'); go.onclick = () => finish(false);
       iv = setInterval(tick, 20); raf = requestAnimationFrame(loop);
     }
@@ -575,7 +590,7 @@
       if (unlock) unlock();
     }
     async function finish(cancel) {
-      if (finished) return; finished = true;
+      if (finished) return; finished = true; ACTIVE = null;
       const tEnd = A.ctx ? A.ctx.currentTime - t0 : 0;
       stopAudio();
       const blobP = rec ? rec.stop() : Promise.resolve(null);
@@ -640,14 +655,14 @@
       const go = $('#go', o); go.disabled = true;
       try { await A.mic(); } catch (e) { go.disabled = false; $('#stt', o).textContent = 'Kein Mikrofonzugriff – bitte erlauben.'; return; }
       unlock = wakeLock(); rec = startRecorder(A.stream); recStart = A.ctx.currentTime; t0 = A.ctx.currentTime + 0.2;
-      running = true; go.disabled = false; go.innerHTML = ICON.stop + ' Fertig'; go.classList.remove('primary'); go.onclick = () => finish(false);
+      running = true; ACTIVE = () => finish(false); go.disabled = false; go.innerHTML = ICON.stop + ' Fertig'; go.classList.remove('primary'); go.onclick = () => finish(false);
       $('#stt', o).textContent = ex.id === 'range' ? 'Ganz tief … halten … dann ganz hoch … halten.' : 'Weich gleiten, auf und ab.';
       iv = setInterval(tick, 20); raf = requestAnimationFrame(loop);
     }
     async function finish(cancel) {
-      if (finished) return; finished = true; running = false; clearInterval(iv); cancelAnimationFrame(raf); if (unlock) unlock();
-      const blob = rec ? await rec.stop() : null;
+      if (finished) return; finished = true; ACTIVE = null; running = false; clearInterval(iv); cancelAnimationFrame(raf); if (unlock) unlock();
       const tEnd = A.ctx ? A.ctx.currentTime - t0 : 0;
+      const blob = rec ? await rec.stop() : null;
       if (cancel || tEnd < 2) { closeOverlay(); return; }
       const a = C.analyzeTake(frames, null);
       const take = makeTake({ type: ex.id === 'range' ? 'range' : 'warmup', refId: ex.id, title: ex.title }, null, frames, a, blob, { audioShift: t0 - recStart, duration: tEnd });
@@ -726,7 +741,7 @@
         <div class="legend">${timed ? '<span><i style="background:var(--accent);opacity:.6"></i>Zielton</span>' + (notes.some(n => n.kind === 'listen') ? '<span><i style="background:var(--listen)"></i>Vorgabe (hören)</span>' : '') : ''}<span><i style="background:var(--good)"></i>≤25 ct</span><span><i style="background:var(--warn)"></i>≤50 ct</span><span><i style="background:var(--bad)"></i>>50 ct</span>${imported && imported.curve ? '<span><i style="background:var(--muted)"></i>Original</span>' : ''}<span class="muted">wischen zum Scrollen</span></div>
         ${tk.audio ? `<div class="player"><button class="btn sm primary" id="pp">${ICON.play}</button><input type="range" id="seek" min="0" max="1000" value="0"><span class="small muted" id="ptime">0:00</span></div>
           ${timed ? `<div class="toggles" style="margin-top:8px;justify-content:flex-start"><button class="tog" id="withref">${imported ? 'Mit Playback' : 'Mit Melodie'} abspielen</button></div>` : ''}` : ''}
-        ${per.length ? `<h2>Ton für Ton</h2><div class="desc">Tippe einen Ton, um genau dort hineinzuhören.</div><div class="notechips">${per.map((p, i) => `<button class="nc ${p.cover < 0.3 ? '' : lvlClass(p.hit * 100 >= 60 ? 80 : p.hit * 100 >= 30 ? 60 : 0)}" data-i="${i}" title="${C.midiToName(p.m)} ${p.cents != null ? (p.cents > 0 ? '+' : '') + p.cents + ' ct' : 'nicht gesungen'}">${esc(p.lyr || C.midiToName(p.m))}</button>`).join('')}</div>` : ''}
+        ${per.length ? `<h2>Ton für Ton</h2><div class="desc">Tippe einen Ton, um genau dort hineinzuhören.</div><div class="notechips">${per.map((p, i) => `<button class="nc ${p.cover < 0.3 ? '' : hitClass(p.hit)}" data-i="${i}" title="${C.midiToName(p.m)} ${p.cents != null ? (p.cents > 0 ? '+' : '') + p.cents + ' ct' : 'nicht gesungen'}">${esc(p.lyr || C.midiToName(p.m))}</button>`).join('')}</div>` : ''}
         ${timed ? `<h2>Einschätzung</h2><div class="stack">${C.insights(m).map(i => `<div class="insight ${i.lvl}"><span class="dot"></span><div>${esc(i.txt)}</div></div>`).join('')}</div>` : ''}
         <div class="stack" style="margin-top:18px">
           ${opts.again ? `<button class="btn primary block" id="again">${ICON.redo} Nochmal</button>` : ''}
@@ -756,7 +771,7 @@
       if (!withRef || !timed) return; await A.ensure(); stopRef(); refBus = A.bus(1);
       const pos = audio.currentTime - shift; const now = A.ctx.currentTime + 0.05;
       if (imported && imported.audio) {
-        try { const buf = await A.ctx.decodeAudioData(await imported.audio.arrayBuffer()); if (!audio || audio.paused) return; refSrc = A.ctx.createBufferSource(); refSrc.buffer = buf; refSrc.connect(refBus); const p2 = audio.currentTime - shift; if (p2 >= 0) refSrc.start(A.ctx.currentTime, p2); else refSrc.start(A.ctx.currentTime - p2); } catch (e) { }
+        try { const buf = await A.decode(imported.id + ':a', imported.audio); if (!audio || audio.paused) return; refSrc = A.ctx.createBufferSource(); refSrc.buffer = buf; refSrc.connect(refBus); const p2 = audio.currentTime - shift; if (p2 >= 0) refSrc.start(A.ctx.currentTime, p2); else refSrc.start(A.ctx.currentTime - p2); } catch (e) { }
       } else notes.forEach(n => { if (n.t + n.d > pos) { const st0 = now + (n.t - pos); if (st0 >= now - 0.01) A.tone(refBus, n.m, st0, n.d, n.kind === 'listen' ? 0.25 : 0.14); } });
     };
     if (tk.audio) {
@@ -846,7 +861,8 @@
     TAKES.forEach(t => (t.perNote || []).forEach(p => { if (p.cents == null || p.cover < 0.5) return; const k = Math.round(p.m); (stats[k] = stats[k] || { s: 0, n: 0 }); stats[k].s += Math.abs(p.cents); stats[k].n++; }));
     Object.values(stats).forEach(v => v.abs = v.s / v.n);
     const r = myRange(); const keys = Object.keys(stats).map(Number);
-    const klo = Math.min(r.low - 2, ...(keys.length ? keys : [r.low])), khi = Math.max(r.high + 2, ...(keys.length ? keys : [r.high]));
+    const inR = keys.filter(k => k >= r.low - 12 && k <= r.high + 12);
+    const klo = Math.min(r.low - 2, ...inR), khi = Math.max(r.high + 2, ...inR);
     Charts.keyboard($('#c3'), stats, klo, khi);
     Charts.line($('#c4'), scored.filter(t => t.metrics.stability != null).map(t => ({ x: t.ts, y: t.metrics.stability, html: `${esc(t.title)}<br>${fmtDT(t.ts)}: <b>±${t.metrics.stability} ct</b>` })), { yMin: 0, unit: '' });
     Charts.calendar($('#c5'), days, 15);
@@ -945,7 +961,11 @@
   }
 
   // ---------------- Start ----------------
-  document.addEventListener('visibilitychange', () => { if (document.hidden && overlay.hidden) A.release(); });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) return;
+    if (ACTIVE) { const f = ACTIVE; ACTIVE = null; f(); }
+    else if (overlay.hidden) A.release();
+  });
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => { });
   try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) { }
   window.__stimmlabor = { S, A, DB, reload, render, openReview, get TAKES() { return TAKES; } };

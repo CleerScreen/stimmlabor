@@ -28,7 +28,7 @@
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
 body { overscroll-behavior: none; -webkit-font-smoothing: antialiased; font-size: 16px; line-height: 1.45; }
-button { font: inherit; color: inherit; }
+button { font: inherit; color: inherit; touch-action: manipulation; }
 #app { display: flex; flex-direction: column; height: 100%; }
 .topbar { display: flex; align-items: center; justify-content: space-between; padding: calc(var(--safe-t) + 10px) var(--gutter) 8px; }
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 20px; letter-spacing: -.01em; }
