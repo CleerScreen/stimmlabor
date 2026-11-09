@@ -1,4 +1,4 @@
-const CACHE = 'stimmlabor-v1.1.0';
+const CACHE = 'stimmlabor-v1.2.0';
 const FILES = ['./', 'index.html', 'styles.css', 'core.js', 'charts.js', 'app.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', e => {

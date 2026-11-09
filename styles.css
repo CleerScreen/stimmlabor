@@ -174,3 +174,7 @@ table.tbl td.num, table.tbl th.num { text-align: right; font-variant-numeric: ta
 .calendar { display: grid; grid-auto-flow: column; grid-template-rows: repeat(7, 1fr); gap: 3px; }
 .calendar i { width: 100%; aspect-ratio: 1; border-radius: 3px; background: var(--surface-2); display: block; }
 .desc { font-size: 13px; color: var(--text-2); margin: -4px 0 10px; }
+
+/* Phrasen-Trainer (v1.2) */
+.phstate { text-align: center; font-size: 22px; font-weight: 700; min-height: 30px; letter-spacing: -.01em; }
+.nc.cur { outline: 2px solid var(--accent); outline-offset: 1px; }

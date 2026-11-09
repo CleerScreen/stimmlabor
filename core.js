@@ -408,6 +408,142 @@
     return out;
   }
 
-  const api = { nameToMidi, midiToName, hzToMidi, midiToHz, SONGS, EXERCISES, parseNotes, harmonize, buildSong, songRange, fitTranspose, buildExercise, exerciseBase, createDetector, createSmoother, analyzeTake, insights, median, mean, foldCents };
+
+  // ---------- Phrasen & Song-Bericht ----------
+  const htTxt = n => n === 1 ? '1 Halbton' : n + ' Halbtöne';
+  // Bei Oktav-Toleranz liegen Cent-Werte gefaltet in ±600. Für Aussagen über eine
+  // durchgehende Verschiebung (z. B. immer ~5 HT zu tief) um den Kreismittelwert entfalten.
+  function unwrapCents(cs, tol) {
+    if (!tol || !cs.length) return cs.slice();
+    let sx = 0, sy = 0; for (const c of cs) { const a = c / 1200 * 2 * Math.PI; sx += Math.cos(a); sy += Math.sin(a); }
+    const mu = Math.atan2(sy, sx) / (2 * Math.PI) * 1200;
+    return cs.map(c => mu + foldCents(c - mu));
+  }
+  // Teilt Noten an Pausen in Phrasen (für Phrasen-Trainer und Bericht).
+  function splitPhrases(notes, o) {
+    o = Object.assign({ gap: 0.6, maxLen: 9, minLen: 1.2 }, o || {});
+    const items = notes.map((n, i) => ({ n, i })).filter(x => x.n.kind == null || x.n.kind === 'sing').sort((a, b) => a.n.t - b.n.t);
+    const end = g => { const l = g[g.length - 1].n; return l.t + l.d; };
+    const len = g => end(g) - g[0].n.t;
+    const groups = []; let cur = [];
+    for (const x of items) {
+      if (cur.length) { const p = cur[cur.length - 1].n; if (x.n.t - (p.t + p.d) >= o.gap) { groups.push(cur); cur = []; } }
+      cur.push(x);
+    }
+    if (cur.length) groups.push(cur);
+    const out = [];
+    const split = g => {
+      const L = len(g);
+      if (L <= o.maxLen || g.length < 4) { out.push(g); return; }
+      let best = 1, bs = -Infinity;
+      for (let k = 1; k < g.length; k++) {
+        const gp = g[k].n.t - (g[k - 1].n.t + g[k - 1].n.d);
+        const pos = (g[k].n.t - g[0].n.t) / L;
+        const sc = gp - Math.abs(pos - 0.5) * 0.4;
+        if (sc > bs) { bs = sc; best = k; }
+      }
+      split(g.slice(0, best)); split(g.slice(best));
+    };
+    groups.forEach(split);
+    // zu kurze Phrasen (unter minLen oder unter 3 Tönen) an den nächstgelegenen Nachbarn hängen
+    const merged = out.map(g => g.slice());
+    const small = x => len(x) < o.minLen || x.length < 3;
+    for (let guard = 0; guard < 200; guard++) {
+      const i = merged.findIndex(x => small(x) && !x.small); if (i < 0 || merged.length < 2) break;
+      const g = merged[i], P = merged[i - 1], N = merged[i + 1];
+      const gp = P ? g[0].n.t - end(P) : Infinity, gn = N ? N[0].n.t - end(g) : Infinity;
+      const okP = P && gp < 3 && end(g) - P[0].n.t <= o.maxLen * 1.5, okN = N && gn < 3 && end(N) - g[0].n.t <= o.maxLen * 1.5;
+      if (okP && (!okN || gp <= gn)) { merged[i - 1] = P.concat(g); merged.splice(i, 1); }
+      else if (okN) { merged[i + 1] = g.concat(N); merged.splice(i, 1); }
+      else if (P && gp < 3) { merged[i - 1] = P.concat(g); merged.splice(i, 1); }
+      else if (N && gn < 3) { merged[i + 1] = g.concat(N); merged.splice(i, 1); }
+      else { g.small = true; if (!merged.some(x => small(x) && !x.small)) break; }
+    }
+    return merged.map((g, k) => ({ k, idx: g.map(x => x.i), t0: g[0].n.t, t1: end(g), notes: g.map(x => x.n) }));
+  }
+  // Rückmeldung zu einer Phrase aus den perNote-Ergebnissen von analyzeTake.
+  function phraseFeedback(per, tol) {
+    const dur = per.reduce((s, p) => s + p.d, 0);
+    const hit = dur ? per.reduce((s, p) => s + (p.hit || 0) * p.d, 0) / dur : 0;
+    const sung = per.filter(p => p.cents != null && p.cover >= 0.3);
+    const r = { hit: Math.round(hit * 100), sung: sung.length, total: per.length, issues: [], weight: (1 - hit) * dur };
+    const label = p => p.lyr ? `„${p.lyr}“` : midiToName(p.m);
+    if (!per.length || sung.length < per.length * 0.5) {
+      r.issues.push({ key: 'missing', sev: 0.95, txt: 'Hier wurde kaum ein Ton erkannt. Sing etwas lauter und halte die Töne bis zum Ende des Balkens.' });
+      r.tip = r.issues[0].txt; return r;
+    }
+    const cs = unwrapCents(sung.map(p => p.cents), tol);
+    const med = median(cs), spread = median(cs.map(c => Math.abs(c - med)));
+    r.offset = Math.round(med); r.spread = Math.round(spread);
+    const steps = Math.round(Math.abs(med) / 100);
+    const transposed = Math.abs(med) >= 150 && spread <= 120;
+    if (transposed) {
+      r.issues.push({ key: 'transposed', sev: 0.9, semitones: Math.round(med / 100), txt: `Der Melodieverlauf stimmt, aber du singst die ganze Phrase etwa ${htTxt(steps)} zu ${med < 0 ? 'tief' : 'hoch'}. Hör dir den ersten Ton genau an und setz dort ein – der Rest folgt dann von selbst.` });
+    } else if (hit < 0.5) {
+      const worst = sung.map((p, i) => ({ p, c: cs[i] })).filter(x => Math.abs(x.c) > 50).sort((a, b) => Math.abs(b.c) - Math.abs(a.c)).slice(0, 2);
+      const w = worst.length ? ' – am deutlichsten bei ' + worst.map(x => `${label(x.p)} (${x.c > 0 ? 'zu hoch' : 'zu tief'})`).join(' und ') : '';
+      r.issues.push({ key: 'inaccurate', sev: 1 - hit, txt: `Die Töne sitzen hier noch nicht${w}. Sing die Phrase langsam auf „nu“ nach, Ton für Ton, und erst dann mit Text.` });
+    }
+    if (!transposed && cs.length >= 3) {
+      const restMed = median(cs.slice(1)), d = cs[0] - restMed;
+      if (Math.abs(d) > 80 && Math.abs(restMed) < 80) r.issues.push({ key: 'start', sev: 0.55, txt: `Der Einsatz auf ${label(sung[0])} liegt etwa ${Math.round(Math.abs(d))} Cent zu ${d < 0 ? 'tief' : 'hoch'}, danach findest du den Ton. Erst innerlich hören, dann einsetzen.` });
+    }
+    if (!transposed && cs.length >= 4) {
+      const h = Math.floor(cs.length / 2), d = median(cs.slice(h)) - median(cs.slice(0, h));
+      if (d <= -60) r.issues.push({ key: 'drift', sev: 0.5 + Math.min(0.4, -d / 300), txt: `Zum Ende der Phrase sackst du um etwa ${Math.round(-d)} Cent ab. Atme vorher tiefer ein und halte die Stütze bis zum letzten Ton.` });
+      else if (d >= 60) r.issues.push({ key: 'drift', sev: 0.45 + Math.min(0.4, d / 300), txt: `Zum Ende der Phrase wirst du um etwa ${Math.round(d)} Cent höher – meist zu viel Druck. Locker bleiben, eher leiser werden.` });
+    }
+    const atts = per.filter(p => p.attack != null).map(p => p.attack);
+    if (atts.length >= 2 && median(atts) > 250) r.issues.push({ key: 'attack', sev: 0.4, txt: `Du rutschst in die Töne hinein (im Schnitt ${Math.round(median(atts))} ms bis der Ton sitzt). Den Ton vorher innerlich hören und direkt drauf einsetzen.` });
+    r.issues.sort((a, b) => b.sev - a.sev);
+    r.tip2 = r.issues.length > 1 ? r.issues[1].txt : null;
+    r.tip = r.issues.length ? r.issues[0].txt : hit >= 0.7 ? 'Sitzt gut – Töne getroffen und gehalten.' : 'Fast. Achte noch einmal auf die rot markierten Töne.';
+    return r;
+  }
+  // Bericht über einen ganzen Song: globale Tendenz + die schwächsten Stellen.
+  function songReport(per, tol, o) {
+    o = o || {};
+    const phrases = splitPhrases(per).map(ph => {
+      const pp = ph.idx.map(i => per[i]);
+      const fb = phraseFeedback(pp, tol);
+      const words = pp.map(p => p.lyr).filter(Boolean);
+      const label = words.length ? words.slice(0, 6).join(' ') + (words.length > 6 ? ' …' : '') : pp.slice(0, 4).map(p => midiToName(p.m)).join(' ') + (pp.length > 4 ? ' …' : '');
+      return Object.assign({ k: ph.k, t0: ph.t0, t1: ph.t1, label }, fb);
+    });
+    const sung = per.filter(p => p.cents != null && p.cover >= 0.3);
+    let global = null;
+    if (sung.length >= 6) {
+      const cs = unwrapCents(sung.map(p => p.cents), tol);
+      const med = median(cs), spread = median(cs.map(c => Math.abs(c - med)));
+      const trFrac = phrases.length ? phrases.filter(p => p.issues.some(i => i.key === 'transposed')).length / phrases.length : 0;
+      const steps = Math.round(Math.abs(med) / 100);
+      if (!tol && Math.abs(Math.abs(med) - 1200) < 150) global = { key: 'octave', txt: `Du singst durchgehend eine Oktave ${med < 0 ? 'tiefer' : 'höher'} als die Melodie. Das ist völlig in Ordnung – schalte „Oktav-tolerant“ ein, dann wird es richtig bewertet.` };
+      else if (Math.abs(med) >= 150 && (trFrac >= 0.4 || spread <= 150)) global = { key: 'transposed', semitones: Math.round(med / 100), txt: `Über den ganzen Song liegst du im Schnitt etwa ${htTxt(steps)} ${med < 0 ? 'unter' : 'über'} der Melodie, den Verlauf triffst du aber oft. Das ist kein Gehörproblem, sondern der falsche Startton. Hör den Einsatzton bewusst mit – oder nimm eine Version, die ${htTxt(steps)} ${med < 0 ? 'tiefer' : 'höher'} liegt.` };
+      else if (Math.abs(med) >= 25 && Math.abs(med) < 150) global = { key: 'bias', txt: `Insgesamt liegst du im Schnitt ${Math.round(Math.abs(med))} Cent zu ${med < 0 ? 'tief' : 'hoch'}. ${med < 0 ? 'Denk die Töne eher „von oben“ an und halte die Atemstütze bis zum Phrasenende.' : 'Etwas weniger Druck, Kehle locker lassen.'}` };
+    }
+    let top;
+    if (global && global.key === 'transposed') {
+      // Wer durchgehend transponiert singt, bekommt die Stellen, die auch relativ zur eigenen Lage wackeln.
+      const sh = global.semitones * 100;
+      const rel = per.map(p => {
+        if (p.cents == null) return p;
+        const c = tol ? foldCents(p.cents - sh) : p.cents - sh, a = Math.abs(c);
+        return Object.assign({}, p, { cents: Math.round(c), hit: a <= 50 ? 1 : a <= 100 ? 0.4 : 0 });
+      });
+      top = splitPhrases(rel).map(ph => {
+        const base = phrases[ph.k] || {};
+        if (base.hit >= 70) return null; // absolut richtig gesungen
+        const fb = phraseFeedback(ph.idx.map(i => rel[i]), tol);
+        const tr = fb.issues.find(i => i.key === 'transposed');
+        const tip = tr ? `Hier wechselst du die Tonlage: etwa ${htTxt(Math.abs(tr.semitones))} ${tr.semitones > 0 ? 'höher' : 'tiefer'} als im Rest des Songs. Hör dir den ersten Ton dieser Phrase an, bevor du einsetzt.`
+          : fb.issues.length ? 'In deiner Tonlage: ' + fb.tip : null;
+        if (!tip) return null;
+        return Object.assign({}, base, { relHit: fb.hit, weight: fb.weight, tip, tip2: tr ? null : fb.tip2, issues: fb.issues });
+      }).filter(Boolean).sort((a, b) => b.weight - a.weight).slice(0, o.max || 3);
+    } else top = phrases.filter(p => p.hit < 70 || p.issues.length).sort((a, b) => b.weight - a.weight).slice(0, o.max || 3);
+    return { global, top, phrases };
+  }
+
+  const api = { nameToMidi, midiToName, hzToMidi, midiToHz, SONGS, EXERCISES, parseNotes, harmonize, buildSong, songRange, fitTranspose, buildExercise, exerciseBase, createDetector, createSmoother, analyzeTake, insights, median, mean, foldCents, unwrapCents, splitPhrases, phraseFeedback, songReport };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.Core = api;
 })(typeof self !== 'undefined' ? self : this);

@@ -2,12 +2,13 @@
 (function () {
   'use strict';
   const C = Core;
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const $ = (s, r) => (r || document).querySelector(s);
   const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
   const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const dayKey = ts => { const d = new Date(ts); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 10); };
   const fmtDT = ts => new Date(ts).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+  const fmtTime = x => { x = Math.max(0, x || 0); return Math.floor(x / 60) + ':' + String(Math.floor(x % 60)).padStart(2, '0'); };
   const hitClass = h => h >= 0.6 ? 'good' : h >= 0.3 ? 'warn' : 'bad';
   const lvlClass = s => s == null ? '' : s >= 80 ? 'good' : s >= 55 ? 'warn' : 'bad';
   const ICON = {
@@ -403,7 +404,7 @@
     let lo, hi;
     if (imported) { lo = Math.min(...def.notes.map(n => n.m)); hi = Math.max(...def.notes.map(n => n.m)); tr = 0; }
     else { ({ lo, hi } = C.songRange(def)); tr = pref.tr != null ? pref.tr : C.fitTranspose(lo, hi, myRange()); }
-    let guide = pref.guide != null ? pref.guide : (imported ? false : S.guide), accomp = pref.accomp != null ? pref.accomp : S.accomp;
+    let guide = pref.guide != null ? pref.guide : (imported ? false : S.guide), accomp = pref.accomp != null ? pref.accomp : S.accomp, startT = pref.start != null ? pref.start : true;
     const takes = TAKES.filter(t => t.refId === id).slice().reverse();
     const r = myRange();
     const o = openOverlay(`<div class="ovhead"><button class="iconbtn" data-x>${ICON.back}</button><div class="t">${esc(def.title)}</div></div><div class="ovbody stack" id="sd"></div>`);
@@ -422,25 +423,29 @@
           <div class="toggles">
             ${imported ? (def.guide ? `<button class="tog ${guide ? 'on' : ''}" data-t="guide">Originalgesang leise</button>` : '') : `<button class="tog ${guide ? 'on' : ''}" data-t="guide">Melodie mitspielen</button><button class="tog ${accomp ? 'on' : ''}" data-t="accomp">Begleitung</button>`}
             <button class="tog ${tol ? 'on' : ''}" data-t="tol">Oktav-tolerant</button>
+            <button class="tog ${startT ? 'on' : ''}" data-t="start">Einsatzton</button>
           </div>
           ${!S.headphones && (guide || imported) ? '<div class="sub">Ohne Kopfhörer hört das Mikro die Melodie mit – das verfälscht die Bewertung. Kopfhörer oder Melodie aus.</div>' : ''}
         </div>
-        <button class="btn primary block" data-go>${ICON.mic} Singen</button>
+        <button class="btn primary block" data-go>${ICON.mic} Ganzen Song singen</button>
+        <button class="btn ghost block" data-ph>${ICON.redo} Phrasen üben</button>
+        <div class="desc" style="margin-top:6px">Phrasen üben: Die App spielt dir eine Stelle vor, du singst sie nach und bekommst sofort eine Rückmeldung – ohne aufs Handy schauen zu müssen.</div>
         <h2>Deine Versuche</h2><div class="list" id="sdt"></div>
         ${imported ? `<button class="btn ghost block" data-del style="margin-top:16px">${ICON.trash} Song löschen</button>` : ''}`;
       takeList($('#sdt'), takes, 'Noch keine Versuche.');
       $$('[data-tr]').forEach(b => b.onclick = () => { tr += +b.dataset.tr; persist(); draw(); });
       $$('[data-tempo]').forEach(b => b.onclick = () => { tempo = +b.dataset.tempo; persist(); draw(); });
-      $$('[data-t]').forEach(b => b.onclick = () => { const k = b.dataset.t; if (k === 'guide') guide = !guide; if (k === 'accomp') accomp = !accomp; if (k === 'tol') tol = !tol; persist(); draw(); });
-      $('[data-go]').onclick = () => startSong(def, null, { tr, tempo, guide, accomp, tol });
+      $$('[data-t]').forEach(b => b.onclick = () => { const k = b.dataset.t; if (k === 'guide') guide = !guide; if (k === 'accomp') accomp = !accomp; if (k === 'tol') tol = !tol; if (k === 'start') startT = !startT; persist(); draw(); });
+      $('[data-go]').onclick = () => startSong(def, null, { tr, tempo, guide, accomp, tol, start: startT });
+      $('[data-ph]').onclick = () => runPhraseTrainer(def, null);
       const dl = $('[data-del]'); if (dl) dl.onclick = async () => { if (!confirm('Song löschen? Deine Aufnahmen bleiben erhalten.')) return; await DB.del('songs', id); await reload(); closeOverlay(); };
     };
-    const persist = () => { S.songPrefs[id] = { tr, tempo, guide, accomp, tol }; saveS(); };
+    const persist = () => { S.songPrefs[id] = Object.assign({}, S.songPrefs[id] || {}, { tr, tempo, guide, accomp, tol, start: startT }); saveS(); };
     draw();
   }
-  async function startSong(def, onSaved, opt) {
-    if (!def) return;
-    const pref = Object.assign({}, S.songPrefs[def.id] || {}, opt || {});
+  // Spielbares Song-Objekt aus Definition + Einstellungen (für Song-Lauf und Phrasen-Trainer)
+  function playableSong(def, pref) {
+    pref = pref || {};
     let song;
     if (def.imported) {
       song = { id: def.id, title: def.title, kind: 'song', imported: true, notes: def.notes.map(n => Object.assign({ kind: 'sing' }, n)), chords: [], spb: 60 / (def.bpm || 100), bpb: 4, duration: (def.duration || (def.notes[def.notes.length - 1].t + 2)) + 0.3, octaveTolerant: pref.tol != null ? pref.tol : true, curve: def.curve, audioBlob: def.audio, guideBlob: def.guide };
@@ -451,7 +456,197 @@
       song = C.buildSong(def, { transpose: tr, tempo: pref.tempo || 1, octaveTolerant: !!pref.tol });
       song.guideOn = pref.guide != null ? pref.guide : S.guide; song.accompOn = pref.accomp != null ? pref.accomp : S.accomp; song.tempo = pref.tempo || 1;
     }
-    runTimed(song, { type: 'song', refId: def.id, title: def.title, onSaved });
+    song.startTone = pref.start != null ? pref.start : true;
+    return song;
+  }
+  async function startSong(def, onSaved, opt) {
+    if (!def) return;
+    const pref = Object.assign({}, S.songPrefs[def.id] || {}, opt || {});
+    runTimed(playableSong(def, pref), { type: 'song', refId: def.id, title: def.title, onSaved });
+  }
+
+  // ---------------- Phrasen-Trainer ----------------
+  // Ablauf je Phrase: Original hören → Einsatzton → nachsingen → sofort Ergebnis (mit Ton-Signal).
+  // Im Auto-Modus läuft das freihändig weiter: gut (≥ 70 %) → nächste Phrase, sonst dieselbe nochmal.
+  function runPhraseTrainer(def, start) {
+    if (!def) return;
+    const pref = S.songPrefs[def.id] || {};
+    const song = playableSong(def, pref);
+    const tol = !!song.octaveTolerant;
+    const phrases = C.splitPhrases(song.notes.filter(n => n.kind === 'sing'));
+    if (!phrases.length) { toast('Keine Phrasen gefunden'); return; }
+    let k = 0;
+    if (start && start.t != null) { let bd = Infinity; phrases.forEach((p, i) => { const d = Math.abs(p.t0 - start.t); if (d < bd) { bd = d; k = i; } }); }
+    else if (start && start.k != null) k = Math.max(0, Math.min(phrases.length - 1, start.k));
+    const scores = Object.assign({}, pref.ph || {});
+    let listen = pref.phListen != null ? pref.phListen : true;
+    let accomp = pref.phAccomp != null ? pref.phAccomp : true;
+    let auto = pref.phAuto != null ? pref.phAuto : true;
+    const persist = () => { S.songPrefs[def.id] = Object.assign({}, S.songPrefs[def.id] || {}, { ph: scores, phListen: listen, phAccomp: accomp, phAuto: auto }); saveS(); };
+    let phase = 'idle', running = false, stopReq = false, closed = false, cycling = false, bus = null, srcs = [], iv = 0, raf = 0, base = 0, timers = [], unlock = null;
+    let frames = [], disp = [], lastBlob = null, lastRes = null, player = null, playerUrl = null, backingBuf = null, guideBuf = null;
+    const smooth = C.createSmoother();
+    const o = openOverlay(`<div class="ovhead"><button class="iconbtn" data-x aria-label="Zurück">${ICON.back}</button><div class="t">Phrasen · ${esc(def.title)}</div></div><div class="ovbody stack" id="pt"></div>`);
+    const ph = () => phrases[k];
+    const label = p => { const w = p.notes.map(n => n.lyr).filter(Boolean); return w.length ? w.slice(0, 6).join(' ') + (w.length > 6 ? ' …' : '') : p.notes.slice(0, 5).map(n => C.midiToName(n.m)).join(' ') + (p.notes.length > 5 ? ' …' : ''); };
+    const wait = ms => new Promise(res => { const x = { res }; x.id = setTimeout(() => { timers = timers.filter(y => y !== x); res(); }, ms); timers.push(x); });
+    const flushTimers = () => { const ts = timers; timers = []; ts.forEach(x => { clearTimeout(x.id); x.res(); }); };
+    function draw() {
+      if (closed || !$('#pt', o)) return;
+      const p = ph();
+      $('#pt', o).innerHTML = `
+        <div class="row between">
+          <button class="btn sm ghost" data-nav="-1" ${k === 0 ? 'disabled' : ''} aria-label="Vorherige Phrase">${ICON.back}</button>
+          <div style="text-align:center"><b>Phrase ${k + 1} von ${phrases.length}</b><div class="sub">${fmtTime(p.t0)} · ${p.notes.length} Töne${scores[k] != null ? ` · zuletzt ${scores[k]} %` : ''}</div></div>
+          <button class="btn sm ghost" data-nav="1" ${k === phrases.length - 1 ? 'disabled' : ''} aria-label="Nächste Phrase"><span style="display:inline-block;transform:scaleX(-1)">${ICON.back}</span></button>
+        </div>
+        <div class="small muted" style="text-align:center">${esc(label(p))}</div>
+        <div class="reviewroll" style="height:190px"><canvas id="pc"></canvas></div>
+        <div class="phstate" id="ps">${phase === 'idle' ? 'Bereit' : ''}</div>
+        <div id="pr"></div>
+        <button class="btn primary block" id="pgo">${running ? ICON.stop + ' Stopp' : ICON.mic + (auto ? ' Start (läuft automatisch weiter)' : ' Start')}</button>
+        <div class="toggles">
+          <button class="tog ${listen ? 'on' : ''}" data-o="listen">Vorher Original hören</button>
+          <button class="tog ${accomp ? 'on' : ''}" data-o="accomp">Begleitung beim Singen</button>
+          <button class="tog ${auto ? 'on' : ''}" data-o="auto">Automatisch weiter</button>
+        </div>
+        <div class="desc">${listen ? 'Du hörst die Stelle zuerst im Original. ' : ''}Vor deinem Einsatz kommt der Startton. ${auto ? 'Danach hörst du ein Signal: hoch = gut, weiter zur nächsten Phrase; tief = dieselbe Phrase nochmal.' : ''}${!S.headphones && accomp ? ' Ohne Kopfhörer hört das Mikro die Begleitung mit – lieber Kopfhörer nutzen oder Begleitung aus.' : ''}</div>
+        <h2>Alle Phrasen</h2>
+        <div class="notechips">${phrases.map((q, i) => `<button class="nc ${scores[i] != null ? lvlClass(scores[i]) : ''} ${i === k ? 'cur' : ''}" data-k="${i}">${i + 1}${scores[i] != null ? ' · ' + scores[i] + ' %' : ''}</button>`).join('')}</div>`;
+      $$('[data-nav]', o).forEach(b => b.onclick = () => { if (running) return; k += +b.dataset.nav; resetPhrase(); draw(); });
+      $$('[data-k]', o).forEach(b => b.onclick = () => { if (running) return; k = +b.dataset.k; resetPhrase(); draw(); });
+      $$('[data-o]', o).forEach(b => b.onclick = () => { const x = b.dataset.o; if (x === 'listen') listen = !listen; if (x === 'accomp') accomp = !accomp; if (x === 'auto') auto = !auto; persist(); if (!running) draw(); else b.classList.toggle('on'); });
+      $('#pgo', o).onclick = () => { if (running) stopAll(); else cycle(); };
+      if (lastRes && phase === 'result') showResult(lastRes);
+      requestAnimationFrame(redraw);
+    }
+    function resetPhrase() { frames = []; disp = []; lastBlob = null; lastRes = null; phase = 'idle'; ph().notes.forEach(n => { delete n.res; }); }
+    function redraw(cursor) {
+      if (closed) return; const cv = $('#pc', o); if (!cv) return;
+      const p = ph(); const ms = p.notes.map(n => n.m);
+      let lo = Math.min(...ms) - 3, hi = Math.max(...ms) + 3; if (hi - lo < 10) { const c = (hi + lo) / 2; lo = c - 5; hi = c + 5; }
+      drawRoll(cv, { notes: p.notes, frames: disp, lo, hi, lyrics: p.notes.some(n => n.lyr), tol, curve: song.curve || null, tA: p.t0 - 0.8, tB: p.t1 + 0.5, cursor: typeof cursor === 'number' ? cursor : null });
+    }
+    const setState = t => { if (closed) return; const el = $('#ps', o); if (el) el.textContent = t; };
+    async function prep() {
+      await A.mic();
+      if (song.imported) {
+        if (!backingBuf && song.audioBlob) { setState('Song wird geladen …'); try { backingBuf = await A.decode(song.id + ':a', song.audioBlob); } catch (e) { toast('Audio konnte nicht dekodiert werden'); } }
+        if (!guideBuf && song.guideBlob) { try { guideBuf = await A.decode(song.id + ':g', song.guideBlob); } catch (e) { } }
+      }
+    }
+    // spielt den Ausschnitt der Phrase; gibt die Kontext-Zeit des Phrasenendes zurück
+    function schedule(p, mode) {
+      const ctx = A.ctx, lead = 1.8;
+      const ts = song.imported ? Math.max(0, p.t0 - lead) : p.t0 - lead;
+      const now = ctx.currentTime + 0.25;
+      base = now - ts;
+      const endT = p.t1 + 0.5;
+      bus = A.bus(1);
+      const play = (buf, vol) => {
+        if (!buf) return;
+        const g = ctx.createGain(); g.gain.value = vol; g.connect(bus);
+        const s = ctx.createBufferSource(); s.buffer = buf; s.connect(g);
+        const off = Math.max(0, ts); s.start(now, off, Math.max(0.1, endT - off + 0.2)); srcs.push(s);
+      };
+      if (song.imported) {
+        if (mode === 'listen') { play(backingBuf, 0.65); if (guideBuf) play(guideBuf, 1); else p.notes.forEach(n => A.tone(bus, n.m, base + n.t, n.d, 0.22)); }
+        else if (accomp) play(backingBuf, 0.8);
+      } else {
+        if (mode === 'listen') p.notes.forEach(n => A.tone(bus, n.m, base + n.t, n.d, 0.3));
+        if (mode === 'listen' || accomp) (song.chords || []).forEach(c => { const a = Math.max(c.t, ts), b = Math.min(c.t + c.d, endT); if (b - a > 0.05) A.chord(bus, c, base + a, b - a); });
+      }
+      if (mode === 'sing') { const f = p.notes[0]; A.tone(bus, f.m, Math.max(now, base + f.t - 1.35), 0.85, 0.26); }
+      return base + endT;
+    }
+    function stopSound() { srcs.forEach(s => { try { s.stop(); } catch (e) { } }); srcs = []; try { bus && bus.disconnect(); } catch (e) { } bus = null; }
+    function signal(good) {
+      const b = A.bus(1), t = A.ctx.currentTime + 0.05;
+      if (good) { A.tone(b, 84, t, 0.14, 0.18); A.tone(b, 88, t + 0.13, 0.22, 0.18); }
+      else { A.tone(b, 64, t, 0.18, 0.2); A.tone(b, 60, t + 0.17, 0.3, 0.2); }
+      setTimeout(() => { try { b.disconnect(); } catch (e) { } }, 1200);
+    }
+    function liveLoop() {
+      if (!running) return;
+      redraw(A.ctx.currentTime - base - A.latency());
+      raf = requestAnimationFrame(liveLoop);
+    }
+    async function playSegment(p, mode) {
+      const endCtx = schedule(p, mode);
+      const tl = setInterval(() => { if (!running) return; const t = A.ctx.currentTime - base; if (mode === 'listen') redraw(t); }, 50);
+      await wait(Math.max(0, (endCtx - A.ctx.currentTime) * 1000));
+      clearInterval(tl); stopSound();
+    }
+    async function singOnce(p) {
+      frames = []; disp = []; p.notes.forEach(n => { delete n.res; });
+      const rec = startRecorder(A.stream);
+      const endCtx = schedule(p, 'sing');
+      setState(`Einsatzton ${C.midiToName(p.notes[0].m)} … jetzt du`);
+      iv = setInterval(() => {
+        const r = A.read(); const t = A.ctx.currentTime - base - A.latency(); const m = smooth(r.m);
+        if (t >= p.t0 - 0.6) { const f = { t, m, r: r.rms }; frames.push(f); disp.push({ t, m }); }
+      }, 20);
+      raf = requestAnimationFrame(liveLoop);
+      await wait(Math.max(0, (endCtx - A.ctx.currentTime) * 1000));
+      clearInterval(iv); cancelAnimationFrame(raf); stopSound();
+      lastBlob = rec ? await rec.stop() : null;
+      const used = { notes: p.notes, octaveTolerant: tol };
+      const a = C.analyzeTake(frames, used);
+      const fb = C.phraseFeedback(a.perNote || [], tol);
+      // Anzeige mit Zeitversatz-Korrektur und Farben
+      disp = frames.map(f => ({ t: f.t + (a.offset || 0), m: f.m })); annotate(disp, p.notes, tol);
+      (a.perNote || []).forEach((pn, i) => { if (p.notes[i]) p.notes[i].res = pn.hit; });
+      return { score: a.score || 0, a, fb };
+    }
+    function showResult(res) {
+      if (closed) return; const el = $('#pr', o); if (!el) return;
+      const s = res.score;
+      el.innerHTML = `<div class="card stack">
+        <div class="row"><div class="badge ${lvlClass(s)}" style="width:58px;height:58px;font-size:18px">${s}%</div>
+          <div class="grow"><div>${esc(res.fb.tip)}</div>${res.fb.tip2 ? `<div class="sub" style="margin-top:4px">${esc(res.fb.tip2)}</div>` : ''}</div></div>
+        <div class="row" style="flex-wrap:wrap;gap:8px">
+          ${lastBlob ? `<button class="btn sm ghost" id="pme">${ICON.play} Mich anhören</button>` : ''}
+          <button class="btn sm ghost" id="porig">${ICON.play} Original</button>
+        </div></div>`;
+      const pm = $('#pme', o); if (pm) pm.onclick = () => playMe();
+      $('#porig', o).onclick = async () => { if (running) return; running = true; try { await prep(); setState('Original …'); await playSegment(ph(), 'listen'); } catch (e) { } running = false; setState(''); redraw(); };
+    }
+    function stopPlayer() { if (player) { player.pause(); player.src = ''; player = null; } if (playerUrl) { URL.revokeObjectURL(playerUrl); playerUrl = null; } }
+    function playMe() { if (!lastBlob || running) return; stopPlayer(); playerUrl = URL.createObjectURL(lastBlob); player = new Audio(playerUrl); player.playsInline = true; player.play().catch(() => toast('Wiedergabe nicht möglich')); }
+    async function cycle() {
+      if (cycling) return; cycling = true;
+      stopPlayer(); stopReq = false; running = true; phase = 'run'; unlock = wakeLock(); ACTIVE = () => stopAll();
+      draw();
+      try { await prep(); } catch (e) { cycling = false; running = false; phase = 'idle'; if (unlock) { unlock(); unlock = null; } ACTIVE = null; draw(); setState('Kein Mikrofonzugriff – bitte erlauben.'); return; }
+      try {
+        while (!stopReq) {
+          const p = ph();
+          if (listen) { setState('Zuhören …'); await playSegment(p, 'listen'); if (stopReq) break; await wait(350); if (stopReq) break; }
+          const res = await singOnce(p); if (stopReq) break;
+          lastRes = res; phase = 'result'; scores[k] = res.score; persist();
+          setState(res.score >= 70 ? 'Gut!' : 'Nochmal');
+          showResult(res); redraw();
+          if (!closed) signal(res.score >= 70);
+          const nc = $$('.nc', o)[k]; if (nc) { nc.className = `nc ${lvlClass(res.score)} cur`; nc.textContent = `${k + 1} · ${res.score} %`; }
+          if (!auto) break;
+          await wait(2600); if (stopReq) break;
+          if (res.score >= 70) { if (k >= phrases.length - 1) { setState('Song geschafft 🎉'); break; } k++; resetPhrase(); draw(); }
+        }
+      } catch (e) { console.error(e); toast('Fehler im Ablauf'); }
+      cycling = false; finishRun();
+    }
+    function finishRun() {
+      running = false; clearInterval(iv); cancelAnimationFrame(raf); stopSound(); flushTimers();
+      if (closed) return;
+      if (unlock) { unlock(); unlock = null; } ACTIVE = null;
+      const st = $('#ps', o) ? $('#ps', o).textContent : '';
+      draw(); if (st && phase === 'result') setState(st);
+    }
+    // Stopp: offene Wartezeiten sofort auflösen, damit der Ablauf sauber endet (Recorder wird dort gestoppt)
+    function stopAll() { stopReq = true; clearInterval(iv); cancelAnimationFrame(raf); stopSound(); flushTimers(); if (!cycling) finishRun(); }
+    $('[data-x]', o).onclick = closeOverlay;
+    overlayCleanup = () => { closed = true; stopReq = true; running = false; clearInterval(iv); cancelAnimationFrame(raf); stopSound(); flushTimers(); stopPlayer(); if (unlock) { unlock(); unlock = null; } ACTIVE = null; };
+    draw();
   }
 
   // ---------------- Üben ----------------
@@ -568,7 +763,14 @@
       rec = startRecorder(A.stream); recStart = ctx.currentTime;
       const countBeats = song.kind === 'exercise' ? 4 : (song.bpb || 4);
       const spb = song.spb || 0.6;
-      t0 = ctx.currentTime + 0.35 + countBeats * spb;
+      // Einsatzton: erster Zielton vorab (bzw. bei langem Intro kurz vor dem Einsatz)
+      const firstSing = song.kind === 'song' && song.startTone ? sing[0] : null;
+      const preTone = firstSing && firstSing.t < 1.6 ? 1.7 : 0;
+      t0 = ctx.currentTime + 0.35 + preTone + countBeats * spb;
+      if (firstSing) {
+        if (preTone) A.tone(bus, firstSing.m, ctx.currentTime + 0.35, 1.2, 0.26);
+        else A.tone(bus, firstSing.m, t0 + firstSing.t - 1.3, 0.9, 0.2);
+      }
       if (window.__testHook) window.__testHook(t0, song);
       for (let k = 0; k < countBeats; k++) A.click(bus, t0 - (countBeats - k) * spb, k === 0);
       if (song.kind === 'exercise') {
@@ -579,7 +781,7 @@
       }
       if (backingBuf) { backing = ctx.createBufferSource(); backing.buffer = backingBuf; backing.connect(bus); backing.start(t0); }
       if (guideBuf) { const g = ctx.createGain(); g.gain.value = 0.35; g.connect(bus); guideSrc = ctx.createBufferSource(); guideSrc.buffer = guideBuf; guideSrc.connect(g); guideSrc.start(t0); }
-      running = true; ACTIVE = () => finish(false); $('#stt', o).textContent = song.kind === 'song' ? 'Sing mit! Die farbige Linie bist du.' : 'Erst zuhören (grau), dann nachsingen (farbig).';
+      running = true; ACTIVE = () => finish(false); $('#stt', o).textContent = song.kind === 'song' ? (firstSing ? `Einsatzton ${C.midiToName(firstSing.m)} – merk ihn dir. Die farbige Linie bist du.` : 'Sing mit! Die farbige Linie bist du.') : 'Erst zuhören (grau), dann nachsingen (farbig).';
       go.disabled = false; go.innerHTML = ICON.stop + ' Beenden'; go.classList.remove('primary'); go.onclick = () => finish(false);
       iv = setInterval(tick, 20); raf = requestAnimationFrame(loop);
     }
@@ -723,6 +925,17 @@
     else if (ms.length) { lo = Math.floor(Math.min(...ms)) - 2; hi = Math.ceil(Math.max(...ms)) + 2; } else { lo = 45; hi = 70; }
     if (hi - lo < 10) { const c = (hi + lo) / 2; lo = c - 5; hi = c + 5; }
     const imported = tk.imported ? IMPORTED.find(s => s.id === tk.refId) : null;
+    const def0 = tk.type === 'song' ? songDef(tk.refId) : null;
+    const report = timed && tk.type === 'song' && per.length >= 4 ? C.songReport(per, tk.tol) : null;
+    const reportHtml = !report ? '' : `<h2>Worauf du achten solltest</h2><div class="stack">
+          ${report.global ? `<div class="insight warn"><span class="dot"></span><div>${esc(report.global.txt)}</div></div>` : ''}
+          ${report.top.length ? report.top.map((p, i) => `<div class="card stack">
+            <div class="row between"><b>${fmtTime(p.t0)} · ${esc(p.label)}</b><span class="chip ${lvlClass(p.hit)}">${p.hit} %</span></div>
+            <div class="sub">${esc(p.tip)}</div>${p.tip2 ? `<div class="sub">${esc(p.tip2)}</div>` : ''}
+            <div class="row" style="gap:8px">${tk.audio ? `<button class="btn sm ghost" data-hear="${i}">${ICON.play} Anhören</button>` : ''}${def0 ? `<button class="btn sm primary" data-drill="${i}">Phrase üben</button>` : ''}</div>
+          </div>`).join('') : `<div class="insight good"><span class="dot"></span><div>${report.global && report.global.key === 'transposed' ? 'Relativ zu deiner Tonlage sitzen die Phrasen – es fehlt nur der richtige Startton.' : 'Keine auffälligen Stellen – jede Phrase lag überwiegend im Ziel.'}</div></div>`}
+        </div>`;
+    const ins = C.insights(m).filter(i => !(report && report.global && /^Tendenz/.test(i.txt)));
     const o = openOverlay(`<div class="ovhead"><button class="iconbtn" data-x>${ICON.back}</button><div class="t">${esc(tk.title)}</div><span class="muted small" style="padding-right:8px">${fmtDT(tk.ts)}</span></div>
       <div class="ovbody">
         ${timed ? `<div class="scorewrap">${ring(m.score || 0)}<div class="grow"><div class="sub">Anteil der Sollzeit, in der du höchstens <b>±50 Cent</b> (ein Viertelton) neben dem Zielton lagst.</div>
@@ -741,8 +954,9 @@
         <div class="legend">${timed ? '<span><i style="background:var(--accent);opacity:.6"></i>Zielton</span>' + (notes.some(n => n.kind === 'listen') ? '<span><i style="background:var(--listen)"></i>Vorgabe (hören)</span>' : '') : ''}<span><i style="background:var(--good)"></i>≤25 ct</span><span><i style="background:var(--warn)"></i>≤50 ct</span><span><i style="background:var(--bad)"></i>>50 ct</span>${imported && imported.curve ? '<span><i style="background:var(--muted)"></i>Original</span>' : ''}<span class="muted">wischen zum Scrollen</span></div>
         ${tk.audio ? `<div class="player"><button class="btn sm primary" id="pp">${ICON.play}</button><input type="range" id="seek" min="0" max="1000" value="0"><span class="small muted" id="ptime">0:00</span></div>
           ${timed ? `<div class="toggles" style="margin-top:8px;justify-content:flex-start"><button class="tog" id="withref">${imported ? 'Mit Playback' : 'Mit Melodie'} abspielen</button></div>` : ''}` : ''}
+        ${reportHtml}
         ${per.length ? `<h2>Ton für Ton</h2><div class="desc">Tippe einen Ton, um genau dort hineinzuhören.</div><div class="notechips">${per.map((p, i) => `<button class="nc ${p.cover < 0.3 ? '' : hitClass(p.hit)}" data-i="${i}" title="${C.midiToName(p.m)} ${p.cents != null ? (p.cents > 0 ? '+' : '') + p.cents + ' ct' : 'nicht gesungen'}">${esc(p.lyr || C.midiToName(p.m))}</button>`).join('')}</div>` : ''}
-        ${timed ? `<h2>Einschätzung</h2><div class="stack">${C.insights(m).map(i => `<div class="insight ${i.lvl}"><span class="dot"></span><div>${esc(i.txt)}</div></div>`).join('')}</div>` : ''}
+        ${timed ? `<h2>Einschätzung</h2><div class="stack">${ins.map(i => `<div class="insight ${i.lvl}"><span class="dot"></span><div>${esc(i.txt)}</div></div>`).join('')}</div>` : ''}
         <div class="stack" style="margin-top:18px">
           ${opts.again ? `<button class="btn primary block" id="again">${ICON.redo} Nochmal</button>` : ''}
           ${tk.audio ? `<button class="btn ghost block" id="share">${ICON.share} Aufnahme sichern / teilen</button>` : ''}
@@ -796,11 +1010,17 @@
         audio.currentTime = Math.max(0, p.t + shift - 0.6);
         try { await audio.play(); pp.innerHTML = ICON.pause; startRef(); frameLoop(); setTimeout(() => { if (audio.currentTime - shift > p.t + p.d + 0.3) audio.pause(); }, (p.d + 1.2) * 1000); } catch (e) { }
       });
+      $$('[data-hear]', o).forEach(b => b.onclick = async () => {
+        const p = report.top[+b.dataset.hear]; viewA = p.t0 - 1; cursor = p.t0; redraw();
+        audio.currentTime = Math.max(0, p.t0 + shift - 0.5);
+        try { await audio.play(); pp.innerHTML = ICON.pause; startRef(); frameLoop(); setTimeout(() => { if (audio.currentTime - shift > p.t1 + 0.3) audio.pause(); }, (p.t1 - p.t0 + 1.2) * 1000); } catch (e) { }
+      });
       $('#share', o).onclick = () => shareTake(tk);
     } else {
       $$('.nc', o).forEach(b => b.onclick = () => { const p = per[+b.dataset.i]; viewA = p.t - 1; cursor = p.t; redraw(); });
     }
     if (opts.again) $('#again', o).onclick = () => { cleanup(); overlayCleanup = null; opts.again(); };
+    $$('[data-drill]', o).forEach(b => b.onclick = () => { const p = report.top[+b.dataset.drill]; cleanup(); overlayCleanup = null; runPhraseTrainer(def0, { t: p.t0 }); });
     $('#del', o).onclick = async () => { if (!confirm('Aufnahme löschen?')) return; await DB.del('takes', tk.id); await reload(); closeOverlay(); };
     const cleanup = () => { if (audio) { audio.pause(); audio.src = ''; } if (url) URL.revokeObjectURL(url); cancelAnimationFrame(rafP); stopRef(); };
     $('[data-x]', o).onclick = closeOverlay;
